@@ -1,0 +1,88 @@
+from reportlab.lib.units import inch
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from scraping.youtube.youtube_custom_scraper import YouTubeTranscriptScraper
+from common.date_range import DateRange
+from common.data import DataLabel
+from flask import Flask, request, jsonify, make_response
+import sys
+import os
+import threading
+import asyncio
+import datetime as dt
+import json
+import traceback
+import re
+from pathlib import Path
+
+# Add the repo root to sys.path so  and  modules are importable:
+here = os.path.dirname(__file__)
+repo_root = os.path.abspath(os.path.join(here, '..'))
+sys.path.insert(0, repo_root)
+
+# Now import modules from the repository
+
+# Import PDF generation libraries
+
+# Create a Flask app for YouTube transcript scraping
+app = Flask(__name__)
+app.config['JSON_SORT_KEYS'] = False  # Preserve order in JSON responses
+API_KEY = os.getenv("API_KEY")  # Optional API key for authentication
+last_job_status = None
+last_job_result = None
+current_job = None
+
+# Create a global scraper instance
+scraper = YouTubeTranscriptScraper()
+
+
+@app.route('/')
+def index():
+    return 'YouTube Transcript Scraper API'
+
+
+@app.route('/test-pdf')
+def test_pdf():
+    # Create a sample PDF
+    transcripts_dir = Path(os.path.join(
+        os.path.dirname(__file__), '..', 'transcripts'))
+    transcripts_dir.mkdir(exist_ok=True)
+
+    filepath = transcripts_dir / 'test.pdf'
+
+    # Create a PDF document
+    doc = SimpleDocTemplate(
+        str(filepath),
+        pagesize=letter,
+        rightMargin=72,
+        leftMargin=72,
+        topMargin=72,
+        bottomMargin=72
+    )
+
+    # Get styles
+    styles = getSampleStyleSheet()
+    title_style = styles['Title']
+    normal_style = styles['Normal']
+
+    # Create document elements
+    elements = []
+
+    # Add title
+    elements.append(Paragraph('Test PDF', title_style))
+    elements.append(Spacer(1, 0.25 * inch))
+
+    # Add some text
+    elements.append(Paragraph('This is a test PDF file.', normal_style))
+
+    # Build the PDF
+    doc.build(elements)
+
+    return f'PDF created at {filepath}'
+
+
+if __name__ == '__main__':
+    print('Starting YouTube Transcript Scraper API')
+    app.run(host='0.0.0.0', port=5000, debug=True)

@@ -1,0 +1,513 @@
+from scraping.youtube.youtube_custom_scraper import YouTubeTranscriptScraper
+from common.date_range import DateRange
+from common.data import DataLabel
+from flask import Flask, request, jsonify, make_response
+import sys
+import os
+import threading
+import asyncio
+import datetime as dt
+import json
+import traceback
+import re
+from pathlib import Path
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+
+# Add the repo root to sys.path so `common` and `scraping` modules are importable:
+here = os.path.dirname(__file__)
+repo_root = os.path.abspath(os.path.join(here, '..'))
+sys.path.insert(0, repo_root)
+
+# Now import modules from the repository
+
+
+app = Flask(__name__)
+app.config['JSON_SORT_KEYS'] = False  # Preserve order in JSON responses
+API_KEY = os.getenv("API_KEY")  # Optional API key for authentication
+last_job_status = None
+last_job_result = None
+current_job = None
+
+# Create a global scraper instance
+scraper = YouTubeTranscriptScraper()
+
+# Helper function to convert DataEntity objects to JSON-serializable dictionaries
+
+
+def entity_to_dict(entity):
+    """Convert a DataEntity to a JSON-serializable dictionary."""
+    try:
+        # Decode the content bytes to get the YouTubeContent object
+        content_str = entity.content.decode("utf-8")
+        content_json = json.loads(content_str)
+
+        # Extract transcript text for easier consumption by frontend
+        transcript_text = ""
+        if "transcript" in content_json and content_json["transcript"]:
+            transcript_text = " ".join(
+                [chunk.get("text", "") for chunk in content_json["transcript"]])
+
+        # Create a simplified dictionary with the most important information
+        return {
+            "video_id": content_json.get("video_id", ""),
+            "title": content_json.get("title", ""),
+            "channel_name": content_json.get("channel_name", ""),
+            "channel_id": content_json.get("channel_id", ""),
+            "upload_date": content_json.get("upload_date", ""),
+            "url": content_json.get("url", ""),
+            "language": content_json.get("language", ""),
+            "duration_seconds": content_json.get("duration_seconds", 0),
+            "transcript_text": transcript_text,
+            "transcript_chunks": len(content_json.get("transcript", [])),
+        }
+    except Exception as e:
+        return {
+            "error": f"Failed to convert entity to dictionary: {str(e)}",
+            "uri": entity.uri
+        }
+
+# Function to run scraping in a background thread
+
+
+async def scrape_video_async(video_id):
+    """Scrape a YouTube video by ID."""
+    try:
+        # Create a date range that includes all videos (very wide range)
+        date_range = DateRange(
+            start=dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc),
+            end=dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+        )
+
+        # Scrape the video
+        entities = await scraper._scrape_video_ids([video_id], date_range)
+        return entities
+    except Exception as e:
+        print(f"Error scraping video {video_id}: {str(e)}")
+        traceback.print_exc()
+        return []
+
+
+async def scrape_channel_async(channel_id, max_videos=5):
+    """Scrape videos from a YouTube channel by ID."""
+    try:
+        # Create a date range for the past year
+        date_range = DateRange(
+            start=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=365),
+            end=dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+        )
+
+        # Scrape the channel
+        entities = await scraper._scrape_channels([channel_id], max_videos, date_range)
+        return entities
+    except Exception as e:
+        print(f"Error scraping channel {channel_id}: {str(e)}")
+        traceback.print_exc()
+        return []
+
+
+def save_transcript_to_pdf(video_data):
+    """
+    Save the transcript of a YouTube video to a PDF file.
+
+    Args:
+        video_data (dict): Dictionary containing video information including transcript
+
+    Returns:
+        str: Path to the saved PDF file or None if saving failed
+    """
+    try:
+        # Create transcripts directory if it doesn't exist
+        transcripts_dir = Path(os.path.join(
+            os.path.dirname(__file__), '..', 'transcripts'))
+        transcripts_dir.mkdir(exist_ok=True)
+
+        # Extract video information
+        video_id = video_data.get('video_id', 'unknown')
+        title = video_data.get('title', 'Untitled')
+
+        # Clean the title to make it suitable for a filename
+        # Remove invalid filename characters
+        clean_title = re.sub(r'[\\/*?:"<>|]', '', title)
+        # Replace spaces with underscores
+        clean_title = re.sub(r'\s+', '_', clean_title)
+
+        # Create a timestamp
+        timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Create the filename
+        filename = f"{clean_title}-{timestamp}-{video_id}.pdf"
+        filepath = transcripts_dir / filename
+
+        # Get the transcript text
+        transcript_text = video_data.get('transcript_text', '')
+
+        if not transcript_text:
+            print(f"No transcript available for video: {title} ({video_id})")
+            return None
+
+        # Create a PDF document
+        doc = SimpleDocTemplate(
+            str(filepath),
+            pagesize=letter,
+            rightMargin=72,
+            leftMargin=72,
+            topMargin=72,
+            bottomMargin=72
+        )
+
+        # Get styles
+        styles = getSampleStyleSheet()
+        title_style = styles['Title']
+        heading_style = styles['Heading2']
+        normal_style = styles['Normal']
+
+        # Create a custom style for metadata
+        metadata_style = ParagraphStyle(
+            'MetadataStyle',
+            parent=styles['Normal'],
+            fontSize=10,
+            spaceAfter=6
+        )
+
+        # Create document elements
+        elements = []
+
+        # Add title
+        elements.append(Paragraph(title, title_style))
+        elements.append(Spacer(1, 0.25 * inch))
+
+        # Add metadata table
+        metadata = [
+            ["Video ID:", video_id],
+            ["URL:", video_data.get('url', '')],
+            ["Channel:", video_data.get('channel_name', '')],
+            ["Upload Date:", video_data.get('upload_date', '')],
+            ["Duration:", f"{video_data.get('duration_seconds', 0)} seconds"]
+        ]
+
+        # Create the table with metadata
+        metadata_table = Table(metadata, colWidths=[1.5*inch, 4*inch])
+        metadata_table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]))
+
+        elements.append(metadata_table)
+        elements.append(Spacer(1, 0.5 * inch))
+
+        # Add transcript heading
+        elements.append(Paragraph("TRANSCRIPT", heading_style))
+        elements.append(Spacer(1, 0.25 * inch))
+
+        # Add transcript text - split into paragraphs for better formatting
+        paragraphs = transcript_text.split('\n\n')
+        for para in paragraphs:
+            if para.strip():
+                elements.append(
+                    Paragraph(para.replace('\n', '<br/>'), normal_style))
+                elements.append(Spacer(1, 0.1 * inch))
+
+        # Build the PDF
+        doc.build(elements)
+
+        print(f"Transcript PDF saved to: {filepath}")
+        return str(filepath)
+
+    except Exception as e:
+        print(f"Error saving transcript to PDF: {str(e)}")
+        traceback.print_exc()
+        return None
+
+
+def save_transcript_to_file(video_data):
+    """
+    Save the transcript of a YouTube video to a text file.
+
+    Args:
+        video_data (dict): Dictionary containing video information including transcript
+
+    Returns:
+        str: Path to the saved transcript file or None if saving failed
+    """
+    try:
+        # Create transcripts directory if it doesn't exist
+        transcripts_dir = Path(os.path.join(
+            os.path.dirname(__file__), '..', 'transcripts'))
+        transcripts_dir.mkdir(exist_ok=True)
+
+        # Extract video information
+        video_id = video_data.get('video_id', 'unknown')
+        title = video_data.get('title', 'Untitled')
+
+        # Clean the title to make it suitable for a filename
+        # Remove invalid filename characters
+        clean_title = re.sub(r'[\\/*?:"<>|]', '', title)
+        # Replace spaces with underscores
+        clean_title = re.sub(r'\s+', '_', clean_title)
+
+        # Create a timestamp
+        timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Create the filename
+        filename = f"{clean_title}-{timestamp}-{video_id}.txt"
+        filepath = transcripts_dir / filename
+
+        # Get the transcript text
+        transcript_text = video_data.get('transcript_text', '')
+
+        if not transcript_text:
+            print(f"No transcript available for video: {title} ({video_id})")
+            return None
+
+        # Write the transcript to the file
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(f"Title: {title}\n")
+            f.write(f"Video ID: {video_id}\n")
+            f.write(f"URL: {video_data.get('url', '')}\n")
+            f.write(f"Channel: {video_data.get('channel_name', '')}\n")
+            f.write(f"Upload Date: {video_data.get('upload_date', '')}\n")
+            f.write(
+                f"Duration: {video_data.get('duration_seconds', 0)} seconds\n")
+            f.write("\n" + "="*50 + "\n\nTRANSCRIPT:\n\n" + "="*50 + "\n\n")
+            f.write(transcript_text)
+
+        print(f"Transcript saved to: {filepath}")
+        return str(filepath)
+
+    except Exception as e:
+        print(f"Error saving transcript: {str(e)}")
+        traceback.print_exc()
+        return None
+
+
+def run_scrape_job(job_type, identifier, max_videos=5):
+    """Run a scraping job in a background thread."""
+    global last_job_status, last_job_result, current_job
+
+    last_job_status = "running"
+    last_job_result = None
+
+    try:
+        # Create an event loop for the thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        if job_type == "video":
+            # Scrape a video
+            entities = loop.run_until_complete(scrape_video_async(identifier))
+        elif job_type == "channel":
+            # Scrape a channel
+            entities = loop.run_until_complete(
+                scrape_channel_async(identifier, max_videos))
+        else:
+            raise ValueError(f"Unknown job type: {job_type}")
+
+        # Convert entities to dictionaries
+        results = [entity_to_dict(entity) for entity in entities]
+
+        # Save transcripts to files (both text and PDF)
+        saved_files = []
+        saved_pdf_files = []
+        for result in results:
+            # Save as text file
+            file_path = save_transcript_to_file(result)
+            if file_path:
+                result['transcript_file'] = file_path
+                saved_files.append(file_path)
+
+            # Save as PDF file
+            pdf_path = save_transcript_to_pdf(result)
+            if pdf_path:
+                result['transcript_pdf_file'] = pdf_path
+                saved_pdf_files.append(pdf_path)
+
+        last_job_result = {
+            "job_type": job_type,
+            "identifier": identifier,
+            "count": len(results),
+            "data": results,
+            "saved_transcript_files": saved_files,
+            "saved_pdf_files": saved_pdf_files
+        }
+        last_job_status = "completed"
+
+    except Exception as e:
+        last_job_status = "failed"
+        last_job_result = {
+            "job_type": job_type,
+            "identifier": identifier,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+    finally:
+        current_job = None
+
+# API Routes
+
+
+@app.route("/api/scrape/video", methods=["POST"])
+def scrape_video():
+    """Endpoint to scrape a YouTube video by ID."""
+    global current_job
+
+    # Check API key if configured
+    if API_KEY and request.headers.get("X-API-KEY") != API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    # Get video ID from request
+    data = request.get_json()
+    if not data or "video_id" not in data:
+        return jsonify({"error": "Missing video_id parameter"}), 400
+
+    video_id = data["video_id"].strip()
+
+    # Validate video ID format (basic check)
+    if not video_id or len(video_id) != 11:
+        return jsonify({"error": "Invalid video_id format. Expected 11-character YouTube video ID"}), 400
+
+    # Check if a job is already running
+    if current_job:
+        return jsonify({
+            "status": "error",
+            "message": "Another job is already running",
+            "current_job": current_job
+        }), 409
+
+    # Start scraping in a background thread
+    current_job = {"type": "video", "id": video_id}
+    threading.Thread(
+        target=run_scrape_job,
+        args=("video", video_id),
+        daemon=True
+    ).start()
+
+    return jsonify({
+        "status": "started",
+        "job_type": "video",
+        "video_id": video_id
+    }), 202
+
+
+@app.route("/api/scrape/channel", methods=["POST"])
+def scrape_channel():
+    """Endpoint to scrape videos from a YouTube channel by ID."""
+    global current_job
+
+    # Check API key if configured
+    if API_KEY and request.headers.get("X-API-KEY") != API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    # Get channel ID from request
+    data = request.get_json()
+    if not data or "channel_id" not in data:
+        return jsonify({"error": "Missing channel_id parameter"}), 400
+
+    channel_id = data["channel_id"].strip()
+    max_videos = int(data.get("max_videos", 5))
+
+    # Limit max_videos to a reasonable range
+    max_videos = max(1, min(10, max_videos))
+
+    # Validate channel ID format (basic check)
+    if not channel_id or len(channel_id) < 10:
+        return jsonify({"error": "Invalid channel_id format. Expected YouTube channel ID"}), 400
+
+    # Check if a job is already running
+    if current_job:
+        return jsonify({
+            "status": "error",
+            "message": "Another job is already running",
+            "current_job": current_job
+        }), 409
+
+    # Start scraping in a background thread
+    current_job = {"type": "channel",
+                   "id": channel_id, "max_videos": max_videos}
+    threading.Thread(
+        target=run_scrape_job,
+        args=("channel", channel_id, max_videos),
+        daemon=True
+    ).start()
+
+    return jsonify({
+        "status": "started",
+        "job_type": "channel",
+        "channel_id": channel_id,
+        "max_videos": max_videos
+    }), 202
+
+
+@app.route("/api/scrape/status", methods=["GET"])
+def get_status():
+    """Get the status of the current or last scraping job."""
+    # Check API key if configured
+    if API_KEY and request.headers.get("X-API-KEY") != API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    return jsonify({
+        "status": last_job_status,
+        "current_job": current_job
+    })
+
+
+@app.route("/api/scrape/result", methods=["GET"])
+def get_result():
+    """Get the result of the last completed scraping job."""
+    # Check API key if configured
+    if API_KEY and request.headers.get("X-API-KEY") != API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if last_job_result is None:
+        return jsonify({
+            "status": last_job_status,
+            "message": "No results available yet"
+        })
+
+    return jsonify({
+        "status": last_job_status,
+        "result": last_job_result
+    })
+
+# Enable CORS for all routes
+
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-API-KEY'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+    return response
+
+# Handle OPTIONS requests for CORS preflight
+
+
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    response = make_response()
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-API-KEY'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+    return response
+
+
+if __name__ == '__main__':
+    # Create transcripts directory if it doesn't exist
+    transcripts_dir = Path(os.path.join(
+        os.path.dirname(__file__), '..', 'transcripts'))
+    transcripts_dir.mkdir(exist_ok=True)
+    print(f"Transcripts will be saved to: {transcripts_dir}")
+
+    app.secret_key = os.getenv('FLASK_SECRET_KEY', 'dev_secret_key')
+    debug_mode = os.getenv(
+        'FLASK_DEBUG', 'False').lower() in ('true', '1', 't')
+    port = int(os.getenv('FLASK_PORT', 5000))
+
+    print(f"Starting YouTube Scraper API on port {port}, debug={debug_mode}")
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
