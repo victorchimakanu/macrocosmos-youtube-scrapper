@@ -13,16 +13,25 @@ from youtube_transcript_api.proxies import WebshareProxyConfig
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+# Insert the 'data-universe' folder two levels up:
+import sys
+from pathlib import Path
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root))
 from common.data import DataEntity, DataLabel, DataSource
 from common.date_range import DateRange
 from scraping.scraper import ScrapeConfig, Scraper, ValidationResult, HFValidationResult
 from scraping.youtube.model import YouTubeContent
 import isodate
 from dotenv import load_dotenv
+import sys
+from pathlib import Path
+
 
 load_dotenv()
 
 bt.logging.set_trace(True)
+
 
 
 class YouTubeTranscriptScraper(Scraper):
@@ -1246,6 +1255,3 @@ async def main():
 if __name__ == "__main__":
     bt.logging.info("Starting YouTube scraper tests...")
     asyncio.run(main())
-
-
-

@@ -2,7 +2,11 @@ import abc
 from enum import Enum
 from typing import Dict, List, Optional
 from pydantic import BaseModel, Field, PositiveInt, ConfigDict
-
+import sys
+from pathlib import Path
+# Insert the 'data-universe' folder two levels up:
+root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(root))
 from common.data import DataEntity, DataLabel, DataSource, StrictBaseModel
 from common.date_range import DateRange
 from storage.miner.miner_storage import MinerStorage

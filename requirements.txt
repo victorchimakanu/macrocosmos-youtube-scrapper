@@ -1,6 +1,11 @@
+Flask
+gunicorn
+google-api-python-client
 apify-client==1.6.1
 asyncpraw==7.8.0
 bittensor==9.0.0
+common==0.1.2
+common.data==0.0.5
 jupyter==1.0.0
 numpy==2.0.1
 pydantic==2.10.1
@@ -21,3 +26,5 @@ loguru==0.7.3
 google-api-python-client==2.167.0
 youtube-transcript-api==1.0.3
 isodate==0.7.2
+reportlab
+requests
